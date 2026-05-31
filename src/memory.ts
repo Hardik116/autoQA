@@ -47,16 +47,55 @@ export class MemoryStore {
     this.dirty = false
   }
 
-  // Build the key from target description + page name
   private key(target: string, pageName: string): string {
     return `${target.toLowerCase().trim()} | ${pageName.toLowerCase().trim()}`
   }
 
+  // Normalize a string for fuzzy comparison — lowercase, remove punctuation, collapse spaces
+  private normalize(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+
+  // Score how similar two strings are — simple word overlap ratio
+  private similarity(a: string, b: string): number {
+    const wordsA = new Set(this.normalize(a).split(' ').filter(w => w.length > 2))
+    const wordsB = new Set(this.normalize(b).split(' ').filter(w => w.length > 2))
+    if (!wordsA.size || !wordsB.size) return 0
+    let overlap = 0
+    for (const w of wordsA) if (wordsB.has(w)) overlap++
+    return overlap / Math.max(wordsA.size, wordsB.size)
+  }
+
   check(target: string, pageName: string): SelectorMemory | null {
-    const entry = this.memory.selectors[this.key(target, pageName)]
-    if (!entry) return null
-    if (entry.failCount >= 3) return null  // too many failures, force re-discovery
-    return entry
+    // 1. Exact match first
+    const exact = this.memory.selectors[this.key(target, pageName)]
+    if (exact && exact.failCount < 3) return exact
+
+    // 2. Fuzzy match — find best scoring entry above threshold
+    const normalTarget = this.normalize(target)
+    const normalPage   = this.normalize(pageName)
+
+    let bestEntry: SelectorMemory | null = null
+    let bestScore = 0
+
+    for (const [key, entry] of Object.entries(this.memory.selectors)) {
+      if (entry.failCount >= 3) continue
+      const [keyTarget, keyPage] = key.split(' | ')
+      if (!keyTarget || !keyPage) continue
+
+      const targetScore = this.similarity(normalTarget, keyTarget)
+      const pageScore   = this.similarity(normalPage, keyPage)
+
+      // Both target AND page must be similar enough
+      const combined = (targetScore * 0.7) + (pageScore * 0.3)
+      if (combined > bestScore && targetScore >= 0.4 && combined >= 0.45) {
+        bestScore = combined
+        bestEntry = entry
+        console.log(`[MEMORY] Fuzzy match: "${target}" ≈ "${keyTarget}" (score: ${combined.toFixed(2)})`)
+      }
+    }
+
+    return bestEntry
   }
 
   save_selector(

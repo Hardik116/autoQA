@@ -1,88 +1,111 @@
 import { HumanMessage, SystemMessage, AIMessage } from '@langchain/core/messages'
+import { ChatOpenAI } from '@langchain/openai'
+import { ChatOllama } from '@langchain/ollama'
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import type { AgentTools } from './tools.js'
-import type { Step } from '../types.js'
+import type { Config, Step } from '../types.js'
 
-const MAX_ITERATIONS = 10  // max loops per step before giving up
+const MAX_ITERATIONS = 12
+
+const TOOL_LIST = `
+EXACT TOOL NAMES — copy exactly, never invent names:
+  navigate           { "path": "/login" }
+  get_dom            {}
+  get_url            {}
+  click              { "selector": "css-selector" }
+  fill               { "selector": "css-selector", "value": "text" }
+  select             { "selector": "css-selector", "value": "option" }
+  wait_seconds       { "seconds": 2 }
+  wait_for_network   {}
+  screenshot         { "label": "name" }
+  check_memory       { "target": "description", "page": "page name" }
+  save_memory        { "target": "description", "page": "page name", "selector": "css", "confidence": "runtime" }
+  mark_memory_failed { "target": "description", "page": "page name" }
+  find_source_file   { "pageName": "login", "srcDir": "path/to/src" }
+  read_source_file   { "filePath": "full/path/to/file.html" }
+`.trim()
 
 const SYSTEM_PROMPT = `
-You are an autonomous browser test agent. You execute test steps by 
-reasoning about the best approach, calling tools, and reflecting on results.
+You are a browser automation agent. You execute test steps by calling tools.
 
-## Your tools
+RULES:
+- You MUST always respond with a JSON object — never plain text
+- NEVER apologize or explain — only output JSON
+- Use ONLY the exact tool names listed below
 
-BROWSER:
-- navigate(path)              — go to a URL path
-- get_dom()                   — get the current page's interactive elements
-- get_url()                   — get the current URL  
-- click(selector)             — click an element by CSS selector
-- fill(selector, value)       — type into an input field
-- select(selector, value)     — choose a dropdown option
-- wait_seconds(n)             — wait N seconds
-- wait_for_network()          — wait for network activity to settle
-- screenshot(label)           — take a screenshot for debugging
+${TOOL_LIST}
 
-MEMORY (check this FIRST before anything else):
-- check_memory(target, page)  — look up a cached selector that worked before
-- save_memory(target, page, selector, confidence, sourceFile?) — save a working selector
-- mark_memory_failed(target, page) — mark a cached selector as broken
+DECISION ORDER for click/fill/select:
+1. check_memory first (fastest)
+2. find_source_file → read_source_file (if memory miss)
+3. get_dom (if source not useful)
+4. Try selector → if works → save_memory → done
 
-CODEBASE:
-- find_source_file(pageName, srcDir) — search for the HTML/template file for a page
-- read_source_file(filePath)         — read a file's content to find selectors
+RESPONSE FORMAT when calling a tool:
+{"reasoning":"why","tool":"tool_name","args":{},"done":false}
 
-## Your decision loop for each step
+RESPONSE FORMAT when step is complete:
+{"reasoning":"what happened","tool":null,"args":{},"done":true,"result":"success","message":"summary"}
 
-1. CHECK MEMORY first — if a working selector exists, try it immediately
-2. If memory miss or selector fails → FIND SOURCE FILE and read the HTML
-3. If source not found or selector not there → GET DOM from browser
-4. Try the selector → if it works → SAVE TO MEMORY → done
-5. If it fails → REFLECT on why → try a different selector → max ${MAX_ITERATIONS} attempts
-6. If stuck → take a SCREENSHOT → report the failure clearly
-
-## Rules
-- Always check memory first — it's the fastest path
-- Always save to memory when something works
-- Mark memory as failed when a cached selector stops working
-- Be specific about WHY something failed in your reasoning
-- When a page changes after an action, the old DOM is stale — get a fresh one
-
-## Response format
-
-Each response must be a JSON object:
-{
-  "reasoning": "why you're taking this action",
-  "tool": "tool_name",
-  "args": { "arg1": "value1" },
-  "done": false
-}
-
-When the step is fully complete:
-{
-  "reasoning": "the step succeeded because...",
-  "tool": null,
-  "args": {},
-  "done": true,
-  "result": "success | failure",
-  "message": "what happened"
-}
+RESPONSE FORMAT when step fails:
+{"reasoning":"why","tool":null,"args":{},"done":true,"result":"failure","message":"what went wrong"}
 `.trim()
 
 interface AgentResponse {
   reasoning: string
   tool: string | null
-  args: Record<string, string | number>
+  args: Record<string, unknown>
   done: boolean
   result?: 'success' | 'failure'
   message?: string
 }
 
+function createJsonModel(config: Config): BaseChatModel {
+  if (config.provider === 'ollama') {
+    return new ChatOllama({
+      model: config.model,
+      baseUrl: config.ollamaUrl ?? 'http://localhost:11434',
+      format: 'json',  // Ollama native JSON mode
+    })
+  }
+
+  // OpenRouter — enable JSON mode via response_format
+  // Works with Gemini 2.0 Flash Lite and most modern models
+  return new ChatOpenAI({
+    modelName: config.model,
+    openAIApiKey: config.apiKey ?? process.env.OPENROUTER_API_KEY ?? '',
+    modelKwargs: {
+      response_format: { type: 'json_object' },  // ← forces valid JSON every time
+    },
+    configuration: {
+      baseURL: 'https://openrouter.ai/api/v1',
+      defaultHeaders: {
+        'HTTP-Referer': 'https://github.com/promptest/promptest',
+        'X-Title': 'promptest',
+      },
+    },
+  })
+}
+
+function tryParseJSON(text: string): AgentResponse | null {
+  try { return JSON.parse(text.trim()) as AgentResponse } catch { /* */ }
+  const s = text.indexOf('{'), e = text.lastIndexOf('}')
+  if (s !== -1 && e > s) {
+    try { return JSON.parse(text.slice(s, e + 1)) as AgentResponse } catch { /* */ }
+  }
+  return null
+}
+
 export class MasterAgent {
+  private model: BaseChatModel
+
   constructor(
-    private model: BaseChatModel,
+    private config: Config,
     private tools: AgentTools,
     private srcDir: string,
-  ) {}
+  ) {
+    this.model = createJsonModel(config)
+  }
 
   async executeStep(step: Step, pageName: string): Promise<{ success: boolean; message: string }> {
     const stepDesc = this.describeStep(step)
@@ -91,138 +114,103 @@ export class MasterAgent {
     const history = [
       new SystemMessage(SYSTEM_PROMPT),
       new HumanMessage(
-        `Current page: "${pageName}"\n` +
-        `Step to execute: ${stepDesc}\n` +
-        `Source directory: ${this.srcDir}\n\n` +
-        `Begin. Check memory first, then source, then DOM. Use at most ${MAX_ITERATIONS} tool calls.`
+        `Page: "${pageName}" | srcDir: ${this.srcDir}\n` +
+        `Step: ${stepDesc}\n\n` +
+        `Start with check_memory. Respond with JSON only.`
       ),
     ]
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const response = await this.model.invoke(history)
-      const text = (response.content as string).trim().replace(/```json|```/g, '').trim()
+      const raw    = (response.content as string)
+      const parsed = tryParseJSON(raw)
 
-      let parsed: AgentResponse
-      try {
-        parsed = JSON.parse(text) as AgentResponse
-      } catch {
-        console.log(`[MASTER] Bad JSON response, retrying... (${text.slice(0, 100)})`)
-        history.push(new AIMessage(text))
-        history.push(new HumanMessage('Your response was not valid JSON. Try again.'))
+      if (!parsed) {
+        console.log(`[MASTER] Bad JSON: ${raw.slice(0, 80).replace(/\n/g, ' ')}`)
+        history.push(new AIMessage(raw))
+        history.push(new HumanMessage(
+          `Invalid JSON. Respond ONLY with a JSON object.\n` +
+          `Example: {"reasoning":"checking memory","tool":"check_memory","args":{"target":"${step.target ?? ''}","page":"${pageName}"},"done":false}`
+        ))
         continue
       }
 
       console.log(`[MASTER] Reasoning: ${parsed.reasoning}`)
 
-      // Step complete
       if (parsed.done) {
         console.log(`[MASTER] Step ${parsed.result}: ${parsed.message}`)
-        return {
-          success: parsed.result === 'success',
-          message: parsed.message ?? '',
-        }
+        return { success: parsed.result === 'success', message: parsed.message ?? '' }
       }
 
-      // Call the requested tool
-      const toolResult = await this.callTool(parsed.tool!, parsed.args)
-      console.log(`[MASTER] Tool "${parsed.tool}" → ${toolResult.success ? 'OK' : 'FAIL'}: ${toolResult.output.slice(0, 150)}`)
+      if (!parsed.tool) {
+        history.push(new AIMessage(raw))
+        history.push(new HumanMessage('Specify a tool or mark done:true.'))
+        continue
+      }
 
-      // Add tool call + result to conversation history
-      history.push(new AIMessage(text))
+      const toolResult = await this.callTool(parsed.tool, parsed.args)
+      console.log(`[MASTER] "${parsed.tool}" → ${toolResult.success ? 'OK' : 'FAIL'}: ${toolResult.output.slice(0, 120)}`)
+
+      history.push(new AIMessage(raw))
       history.push(new HumanMessage(
-        `Tool "${parsed.tool}" result:\n` +
-        `Success: ${toolResult.success}\n` +
-        `Output: ${toolResult.output}\n\n` +
-        `Continue. If the step is done mark done:true. If failed after multiple tries, mark done:true result:failure.`
+        `Tool "${parsed.tool}" result:\nsuccess:${toolResult.success}\noutput:${toolResult.output}\n\nContinue. JSON only.`
       ))
     }
 
-    return { success: false, message: `Step did not complete within ${MAX_ITERATIONS} iterations` }
+    return { success: false, message: `Did not complete within ${MAX_ITERATIONS} iterations` }
   }
 
-  async evaluateAssertion(assertion: string, pageName: string): Promise<{
-    passed: boolean
-    reason: string
-  }> {
+  async evaluateAssertion(assertion: string, pageName: string): Promise<{ passed: boolean; reason: string }> {
     console.log(`[MASTER] Evaluating: "${assertion}"`)
-
     const dom = await this.tools.get_dom()
     const url = await this.tools.get_url()
 
     const response = await this.model.invoke([
       new SystemMessage(
-        'You are a QA engineer evaluating a single test assertion. ' +
-        'Return ONLY a JSON object: {"passed": true/false, "reason": "explanation"}'
+        'You are a QA engineer. Evaluate the assertion against the page DOM.\n' +
+        'Respond with ONLY this JSON: {"passed":true,"reason":"explanation"}'
       ),
-      new HumanMessage(
-        `Current URL: ${url.output}\n` +
-        `Page DOM:\n${dom.output}\n\n` +
-        `Assertion: "${assertion}"\n\n` +
-        `Return JSON only.`
-      ),
+      new HumanMessage(`URL:${url.output}\nDOM:\n${dom.output}\n\nAssertion:"${assertion}"\n\nJSON:`),
     ])
 
-    const text = (response.content as string).trim().replace(/```json|```/g, '').trim()
-    try {
-      const result = JSON.parse(text) as { passed: boolean; reason: string }
-      const icon = result.passed ? '✓' : '✗'
-      console.log(`[MASTER] ${icon} ${result.reason}`)
-      return result
-    } catch {
-      return { passed: false, reason: `Could not parse assertion result: ${text}` }
+    const parsed = tryParseJSON(response.content as string) as unknown as { passed: boolean; reason: string } | null
+    if (parsed) {
+      console.log(`[MASTER] ${parsed.passed ? '✓' : '✗'} ${parsed.reason}`)
+      return parsed
     }
+    return { passed: false, reason: 'Could not parse assertion result' }
   }
-
-  // ── helpers ────────────────────────────────────────────────────────────────
 
   private describeStep(step: Step): string {
     switch (step.action) {
-      case 'navigate':    return `navigate to ${step.value}`
-      case 'click':       return `click: "${step.target}"`
-      case 'fill':        return `fill: "${step.target}" with "${step.value}"`
-      case 'select':      return `select: "${step.value}" in "${step.target}"`
-      case 'waitFor':     return `wait for: ${step.condition}`
-      case 'waitForSec':  return `wait ${step.value} seconds`
-      default:            return JSON.stringify(step)
+      case 'navigate':   return `navigate to ${step.value}`
+      case 'click':      return `click: "${step.target}"`
+      case 'fill':       return `fill: "${step.target}" with "${step.value}"`
+      case 'select':     return `select: "${step.value}" in "${step.target}"`
+      case 'waitFor':    return `wait for: ${step.condition}`
+      case 'waitForSec': return `wait ${step.value} seconds`
+      default:           return JSON.stringify(step)
     }
   }
 
-  private async callTool(
-    tool: string,
-    args: Record<string, string | number>
-  ): Promise<{ success: boolean; output: string }> {
+  private async callTool(tool: string, args: Record<string, unknown>): Promise<{ success: boolean; output: string }> {
+    const VALID = 'Valid tools: navigate,get_dom,get_url,click,fill,select,wait_seconds,wait_for_network,screenshot,check_memory,save_memory,mark_memory_failed,find_source_file,read_source_file'
     switch (tool) {
-      // browser
-      case 'navigate':          return this.tools.navigate(args.path as string)
-      case 'get_dom':           return this.tools.get_dom()
-      case 'get_url':           return this.tools.get_url()
-      case 'click':             return this.tools.click(args.selector as string)
-      case 'fill':              return this.tools.fill(args.selector as string, args.value as string)
-      case 'select':            return this.tools.select(args.selector as string, args.value as string)
-      case 'wait_seconds':      return this.tools.wait_seconds(args.seconds as number)
-      case 'wait_for_network':  return this.tools.wait_for_network()
-      case 'screenshot':        return this.tools.screenshot(args.label as string)
-
-      // memory
-      case 'check_memory':
-        return this.tools.check_memory(args.target as string, args.page as string)
-      case 'save_memory':
-        return this.tools.save_memory(
-          args.target as string, args.page as string,
-          args.selector as string, args.confidence as 'source' | 'runtime',
-          args.sourceFile as string | undefined
-        )
-      case 'mark_memory_failed':
-        return this.tools.mark_memory_failed(args.target as string, args.page as string)
-
-      // codebase
-      case 'find_source_file':
-        return this.tools.find_source_file(args.pageName as string, args.srcDir as string)
-      case 'read_source_file':
-        return this.tools.read_source_file(args.filePath as string)
-
-      default:
-        return { success: false, output: `Unknown tool: ${tool}` }
+      case 'navigate':           return this.tools.navigate(args.path as string)
+      case 'get_dom':            return this.tools.get_dom()
+      case 'get_url':            return this.tools.get_url()
+      case 'click':              return this.tools.click(args.selector as string)
+      case 'fill':               return this.tools.fill(args.selector as string, args.value as string)
+      case 'select':             return this.tools.select(args.selector as string, args.value as string)
+      case 'wait_seconds':       return this.tools.wait_seconds(Number(args.seconds ?? 1))
+      case 'wait_for_network':   return this.tools.wait_for_network()
+      case 'screenshot':         return this.tools.screenshot((args.label as string) ?? 'debug')
+      case 'check_memory':       return this.tools.check_memory(args.target as string, args.page as string)
+      case 'save_memory':        return this.tools.save_memory(args.target as string, args.page as string, args.selector as string, args.confidence as 'source' | 'runtime', args.sourceFile as string | undefined)
+      case 'mark_memory_failed': return this.tools.mark_memory_failed(args.target as string, args.page as string)
+      case 'find_source_file':   return this.tools.find_source_file(args.pageName as string, (args.srcDir as string) ?? this.srcDir)
+      case 'read_source_file':   return this.tools.read_source_file(args.filePath as string)
+      default:                   return { success: false, output: `Unknown tool: "${tool}". ${VALID}` }
     }
   }
 }

@@ -13,6 +13,7 @@ export interface ExtractedElement {
 // File patterns that contain HTML across every major framework
 const HTML_PATTERNS = [
   '**/*.component.html',   // Angular
+  '**/*.pages.html',       // ← your pattern
   '**/*.html',             // plain HTML, Blade, Django, Rails
   '**/*.tsx',              // React, Next.js
   '**/*.jsx',              // React (older)

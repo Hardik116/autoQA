@@ -2,26 +2,25 @@ name: User login and create item
 tags: auth, smoke
 
 --- login page ---
-navigate: /login
-waitForSec: 10
+navigate: /#/sign-in
+waitForSec: 3
 fill: store name / email field >> selenium_store
 fill: the password field >> rAw-password1
 click: the submit button
-waitFor: loading complete snackbar to appear
-verify: store name should be selenium_store on top left corner
+waitForSec: 15
 
 --- dashboard ---
-# page already changed after login — no navigate needed
-click: inventory dropdown on navbar
-click: create item option from dropdown
-waitFor: create item form to appear
+waitForSec: 2
+navigate: /#/items-category-list
+waitForSec: 2
 
 --- create item form ---
 click: VEHICLE button
-waitFor: form to appear
+waitForSec: 2
 fill: item id field >> test_item_123
 fill: item name field >> test_item_123
 fill: item description field >> this is a test item
 fill: amount field >> 1000
 fill: tax field >> 12_Percent
+waitForSec: 1
 verify: all filled fields should show correct values

@@ -1,37 +1,13 @@
 import path from 'path'
 import { mkdirSync } from 'fs'
-import { ChatOpenAI } from '@langchain/openai'
-import { ChatOllama } from '@langchain/ollama'
-import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { MasterAgent } from './agents/master.js'
 import { AgentTools } from './agents/tools.js'
 import { BrowserSession } from './browser.js'
 import { MemoryStore } from './memory.js'
 import { parsePromptFile } from './parser.js'
-import { printResults } from './reporter.js'
 import type { Config, TestResult, PageResult, AssertionResult } from './types.js'
 
 const SCREENSHOT_DIR = '.promptest/screenshots'
-
-function createModel(config: Config): BaseChatModel {
-  if (config.provider === 'ollama') {
-    return new ChatOllama({
-      model: config.model,
-      baseUrl: config.ollamaUrl ?? 'http://localhost:11434',
-    })
-  }
-  return new ChatOpenAI({
-    modelName: config.model,
-    openAIApiKey: config.apiKey ?? process.env.OPENROUTER_API_KEY ?? '',
-    configuration: {
-      baseURL: 'https://openrouter.ai/api/v1',
-      defaultHeaders: {
-        'HTTP-Referer': 'https://github.com/promptest/promptest',
-        'X-Title': 'promptest',
-      },
-    },
-  })
-}
 
 export async function runTest(filePath: string, config: Config): Promise<TestResult> {
   const start = Date.now()
@@ -43,8 +19,6 @@ export async function runTest(filePath: string, config: Config): Promise<TestRes
   await memory.load()
 
   const browser = new BrowserSession()
-  const model   = createModel(config)
-
   let prompt
   try {
     prompt = await parsePromptFile(filePath)
@@ -61,7 +35,7 @@ export async function runTest(filePath: string, config: Config): Promise<TestRes
   await browser.launch(config.headless)
 
   const tools  = new AgentTools(browser, memory, baseUrl)
-  const agent  = new MasterAgent(model, tools, config.srcDir ?? '.')
+  const agent  = new MasterAgent(config, tools, config.srcDir ?? '.')
   const pageResults: PageResult[] = []
 
   try {
