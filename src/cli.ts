@@ -5,7 +5,6 @@ import { loadConfig } from './config.js'
 import { findPromptFiles } from './parser.js'
 import { runTest } from './runner.js'
 import { printResults } from './reporter.js'
-import { record } from './recorder.js'
 import { initMemory } from './init-memory.js'
 
 const program = new Command()
@@ -63,16 +62,16 @@ program
   })
 
 // ── record ────────────────────────────────────────────────────────────────────
-program
-  .command('record')
-  .description('Record browser interactions and generate a .prompt file')
-  .option('-o, --output <path>', 'output file path', './tests/recorded.prompt')
-  .option('--base-url <url>',    'base URL to open',  'http://localhost:3000')
-  .action(async (opts) => {
-    const config = await loadConfig()
-    if (opts.baseUrl) config.baseUrl = opts.baseUrl
-    await record(opts.output, config.baseUrl, config)
-  })
+// program
+//   .command('record')
+//   .description('Record browser interactions and generate a .prompt file')
+//   .option('-o, --output <path>', 'output file path', './tests/recorded.prompt')
+//   .option('--base-url <url>',    'base URL to open',  'http://localhost:3000')
+//   .action(async (opts) => {
+//     const config = await loadConfig()
+//     if (opts.baseUrl) config.baseUrl = opts.baseUrl
+//     await record(opts.output, config.baseUrl, config)
+//   })
 
 // ── init ──────────────────────────────────────────────────────────────────────
 program
